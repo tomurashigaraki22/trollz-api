@@ -1,16 +1,17 @@
 import pymysql
 import pymysql.cursors
-import os
-from dotenv import load_dotenv
 
-load_dotenv()
+DB_CONFIG = {
+    "host": "57.131.33.181",
+    "port": 3306,
+    "user": "admin",
+    "password": "Pityboy@22",
+    "database": "trollzv3",
+}
 
 def get_conn():
     return pymysql.connect(
-        host=os.getenv("DB_HOST", "localhost"),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"),
-        database=os.getenv("DB_NAME"),
+        **DB_CONFIG,
         cursorclass=pymysql.cursors.DictCursor,
         charset="utf8mb4",
         autocommit=True,
