@@ -1,6 +1,8 @@
 import os
 import json
+import uuid
 from datetime import datetime, timedelta
+import bcrypt
 from flask import Blueprint, request, jsonify
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from lib.db import query, query_one, execute
@@ -108,12 +110,34 @@ def load_seller_from_token():
 
 def create_token(user):
     payload = {
-        "seller_id": user.get("id"),
+        "seller_id": user.get("seller_id") or user.get("id"),
         "email": user.get("email"),
         "name": user.get("name"),
         "role": user.get("role"),
     }
     return _serializer.dumps(payload)
+
+
+def is_bcrypt_hash(value):
+    return isinstance(value, str) and value.startswith(("$2a$", "$2b$", "$2y$"))
+
+
+def verify_password(user, password, table_name=None):
+    stored_password = user.get("password") if user else None
+    if not stored_password:
+        return False
+
+    if is_bcrypt_hash(stored_password):
+        try:
+            return bcrypt.checkpw(password.encode("utf-8"), stored_password.encode("utf-8"))
+        except ValueError:
+            return False
+
+    matches = stored_password == password
+    if matches and table_name == "users":
+        hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+        execute("UPDATE users SET password=%s WHERE id=%s", (hashed, user.get("id")))
+    return matches
 
 
 def get_seller_id():
@@ -166,21 +190,26 @@ def login():
         return jsonify({"error": "Email and password are required"}), 400
 
     user = query_one(
-        "SELECT id, email, name, password, role FROM users WHERE email=%s LIMIT 1",
+        "SELECT id, email, name, password, role, status FROM users WHERE LOWER(email)=LOWER(%s) LIMIT 1",
         (email,),
     )
+    user_table = "users" if user else None
 
     if not user:
         user = query_one(
-            "SELECT id, email, name, password, role FROM seller_team WHERE email=%s LIMIT 1",
+            "SELECT id, seller_id, email, name, password, role FROM seller_team WHERE LOWER(email)=LOWER(%s) LIMIT 1",
             (email,),
         )
+        user_table = "seller_team" if user else None
 
-    if not user or user.get("password") != password:
+    if not user or not verify_password(user, password, user_table):
         return jsonify({"error": "Invalid credentials"}), 401
 
     if user.get("role") not in SELLER_ROLES:
         return jsonify({"error": "Not authorized"}), 403
+
+    if user_table == "users" and str(user.get("status", 1)) in ("0", "False", "false"):
+        return jsonify({"error": "Seller account is inactive"}), 403
 
     token = create_token(user)
     return jsonify({
