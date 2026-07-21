@@ -362,7 +362,7 @@ def dashboard():
 def get_products():
     seller_id = get_seller_id()
     if not seller_id:
-        return jsonify([])
+        return jsonify({"success": True, "data": []})
 
     params = []
     sql = "SELECT * FROM seller_products WHERE seller_id = %s"
@@ -378,7 +378,7 @@ def get_products():
         params.append(status)
 
     sql += " ORDER BY id DESC"
-    return jsonify(query(sql, params))
+    return jsonify({"success": True, "data": query(sql, params)})
 
 
 @seller_bp.route("/products", methods=["POST"])
@@ -396,11 +396,12 @@ def create_product():
     status = data.get("status") or "active"
     image_url = data.get("image_url") or data.get("img")
 
-    execute(
+    product_id = execute(
         "INSERT INTO seller_products (seller_id, name, description, price, stock, category, status, image_url) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
         (seller_id, name, description, price, stock, category, status, image_url),
     )
-    return jsonify({"success": True})
+    product = query_one("SELECT * FROM seller_products WHERE id=%s AND seller_id=%s", (product_id, seller_id))
+    return jsonify({"success": True, "data": product})
 
 
 @seller_bp.route("/products/<int:pid>", methods=["PUT"])
