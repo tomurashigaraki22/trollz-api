@@ -30,6 +30,8 @@ def check_api_key():
         return
     if request.path.startswith("/api/seller") or request.path == "/api/health":
         return
+    if request.method == "GET" and request.path.startswith("/api/categories"):
+        return
     key = request.headers.get("X-API-Key", "")
     if key != API_SECRET_KEY:
         return jsonify({"error": "Unauthorized"}), 401
