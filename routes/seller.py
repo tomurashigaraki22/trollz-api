@@ -506,7 +506,7 @@ def get_products():
     sql += " ORDER BY id DESC"
     products = query(sql, params)
     for product in products:
-        if not product.get("storefront_product_id") and product.get("status") != "draft":
+        if product.get("status") != "draft":
             sync_seller_product_to_storefront(product)
     return jsonify({"success": True, "data": query(sql, params)})
 
