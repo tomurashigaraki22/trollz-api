@@ -108,6 +108,40 @@ def product_images_json(image_url):
     return json.dumps([image_url]) if image_url else json.dumps([])
 
 
+def resolve_storefront_category(category_name):
+    category = (category_name or "").strip()
+    if category:
+        existing = query_one(
+            "SELECT id, category, parent_id FROM category WHERE LOWER(category)=LOWER(%s) LIMIT 1",
+            (category,),
+        )
+        if existing:
+            if existing.get("parent_id"):
+                parent = query_one("SELECT id, category FROM category WHERE id=%s LIMIT 1", (existing["parent_id"],))
+                return {
+                    "category": (parent or existing).get("category"),
+                    "category_id": (parent or existing).get("id"),
+                    "subcategory": existing.get("category"),
+                    "subcategory_id": existing.get("id"),
+                }
+            return {
+                "category": existing.get("category"),
+                "category_id": existing.get("id"),
+                "subcategory": "",
+                "subcategory_id": None,
+            }
+
+    fallback = query_one("SELECT id, category FROM category WHERE parent_id IS NULL ORDER BY id LIMIT 1")
+    if fallback:
+        return {
+            "category": fallback.get("category"),
+            "category_id": fallback.get("id"),
+            "subcategory": "",
+            "subcategory_id": None,
+        }
+    return {"category": category or "Marketplace", "category_id": 1, "subcategory": "", "subcategory_id": None}
+
+
 def sync_seller_product_to_storefront(seller_product):
     if not seller_product or seller_product.get("status") == "draft":
         return None
@@ -117,7 +151,7 @@ def sync_seller_product_to_storefront(seller_product):
     name = seller_product.get("name") or "Seller product"
     price = seller_product.get("price") or 0
     stock = seller_product.get("stock") or 0
-    category = seller_product.get("category") or "Marketplace"
+    category_info = resolve_storefront_category(seller_product.get("category"))
     description = seller_product.get("description") or ""
     image_json = product_images_json(seller_product.get("image_url"))
     existing_product_id = seller_product.get("storefront_product_id")
@@ -126,14 +160,18 @@ def sync_seller_product_to_storefront(seller_product):
         execute(
             """
             UPDATE product
-            SET item=%s, category=%s, subcategory=%s, price=%s, old_price=%s, discount=0,
-                description=%s, supplier=%s, img=%s, qty=%s, stock=%s
+            SET item=%s, category=%s, subcategory=%s, parent_category_id=%s, subcategory_id=%s,
+                category_id=%s, price=%s, old_price=%s, discount=0,
+                description=%s, supplier=%s, img=%s, qty=%s, stock=%s, new=%s
             WHERE id=%s
             """,
             (
                 name,
-                category,
-                "",
+                category_info["category"],
+                category_info["subcategory"],
+                category_info["category_id"],
+                category_info["subcategory_id"],
+                category_info["category_id"],
                 price,
                 price,
                 description,
@@ -141,6 +179,7 @@ def sync_seller_product_to_storefront(seller_product):
                 image_json,
                 stock,
                 stock,
+                1,
                 existing_product_id,
             ),
         )
@@ -149,10 +188,26 @@ def sync_seller_product_to_storefront(seller_product):
     storefront_product_id = execute(
         """
         INSERT INTO product
-            (item, category, subcategory, price, old_price, discount, description, supplier, img, qty, stock, date)
-        VALUES (%s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s, NOW())
+            (item, category, subcategory, parent_category_id, subcategory_id, category_id,
+             price, old_price, discount, description, supplier, new, img, qty, stock, date)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s, %s, NOW())
         """,
-        (name, category, "", price, price, description, supplier, image_json, stock, stock),
+        (
+            name,
+            category_info["category"],
+            category_info["subcategory"],
+            category_info["category_id"],
+            category_info["subcategory_id"],
+            category_info["category_id"],
+            price,
+            price,
+            description,
+            supplier,
+            1,
+            image_json,
+            stock,
+            stock,
+        ),
     )
     execute(
         "UPDATE seller_products SET storefront_product_id=%s WHERE id=%s AND seller_id=%s",
