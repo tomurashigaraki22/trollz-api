@@ -262,7 +262,7 @@ def debug_auth():
 def login():
     data = request.get_json(silent=True) or {}
     email = data.get("email", "").strip()
-    password = data.get("password", "")
+    password = data.get("password", "").strip()
 
     if not email or not password:
         return jsonify({"error": "Email and password are required"}), 400
@@ -280,8 +280,21 @@ def login():
         )
         user_table = "seller_team" if user else None
 
-    if not user or not verify_password(user, password, user_table):
-        return jsonify({"error": "Invalid credentials"}), 401
+    password_matches = verify_password(user, password, user_table) if user else False
+    if not user or not password_matches:
+        return jsonify({
+            "error": "Invalid credentials",
+            "debug": {
+                "email_received": email,
+                "password_length_received": len(password),
+                "user_found": bool(user),
+                "user_table": user_table,
+                "password_kind": password_kind(user.get("password")) if user else None,
+                "password_prefix": user.get("password", "")[:7] if user else None,
+                "password_length_stored": len(user.get("password", "")) if user else 0,
+                "password_matches": password_matches,
+            },
+        }), 401
 
     if user.get("role") not in SELLER_ROLES:
         return jsonify({"error": "Not authorized"}), 403
