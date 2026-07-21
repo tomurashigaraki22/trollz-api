@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 import bcrypt
 from flask import Blueprint, request, jsonify
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
-from lib.db import query, query_one, execute
+from lib.db import DB_CONFIG, query, query_one, execute
 from lib.cloudinary_helper import upload_image
 
 seller_bp = Blueprint("seller", __name__)
@@ -178,6 +178,84 @@ def create_default_seller():
 def initialize_seller_module():
     ensure_seller_tables()
     create_default_seller()
+
+
+def password_kind(value):
+    if not value:
+        return "missing"
+    if is_bcrypt_hash(value):
+        return "bcrypt"
+    return "plain"
+
+
+def public_user_debug(user):
+    if not user:
+        return {"exists": False}
+
+    password = user.get("password")
+    return {
+        "exists": True,
+        "id": user.get("id"),
+        "seller_id": user.get("seller_id"),
+        "email": user.get("email"),
+        "name": user.get("name"),
+        "role": user.get("role"),
+        "status": user.get("status"),
+        "password_kind": password_kind(password),
+        "password_prefix": password[:7] if password else None,
+        "password_length": len(password) if password else 0,
+    }
+
+
+@seller_bp.route("/debug-auth", methods=["POST"])
+def debug_auth():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip()
+    password = data.get("password") or ""
+
+    db_status = query_one("SELECT DATABASE() AS db_name, USER() AS db_user, @@hostname AS db_hostname")
+    table_counts = query_one(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM users) AS users_count,
+            (SELECT COUNT(*) FROM users WHERE role='Seller') AS sellers_count,
+            (SELECT COUNT(*) FROM seller_team) AS seller_team_count
+        """
+    )
+
+    user = None
+    team_user = None
+    if email:
+        user = query_one(
+            "SELECT id, email, name, password, role, status FROM users WHERE LOWER(email)=LOWER(%s) LIMIT 1",
+            (email,),
+        )
+        team_user = query_one(
+            "SELECT id, seller_id, email, name, password, role FROM seller_team WHERE LOWER(email)=LOWER(%s) LIMIT 1",
+            (email,),
+        )
+
+    verification = {
+        "password_was_sent": bool(password),
+        "users_password_matches": verify_password(user, password, "users") if user and password else False,
+        "seller_team_password_matches": verify_password(team_user, password, "seller_team") if team_user and password else False,
+    }
+
+    return jsonify({
+        "success": True,
+        "api_db_config": {
+            "host": DB_CONFIG.get("host"),
+            "port": DB_CONFIG.get("port"),
+            "database": DB_CONFIG.get("database"),
+            "user": DB_CONFIG.get("user"),
+        },
+        "connected_database": db_status,
+        "table_counts": table_counts,
+        "lookup_email": email,
+        "users_table": public_user_debug(user),
+        "seller_team_table": public_user_debug(team_user),
+        "verification": verification,
+    })
 
 
 @seller_bp.route("/login", methods=["POST"])
