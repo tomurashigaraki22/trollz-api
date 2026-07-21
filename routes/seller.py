@@ -92,8 +92,79 @@ def ensure_seller_tables():
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """,
         )
+
+        if not column_exists("seller_products", "storefront_product_id"):
+            execute("ALTER TABLE seller_products ADD COLUMN storefront_product_id INT NULL")
     except Exception as exc:
         print("Unable to create seller tables:", exc)
+
+
+def get_seller_store_name(seller_id):
+    seller = query_one("SELECT name, email FROM users WHERE id=%s LIMIT 1", (seller_id,))
+    return (seller or {}).get("name") or (seller or {}).get("email") or DEFAULT_SELLER_STORE
+
+
+def product_images_json(image_url):
+    return json.dumps([image_url]) if image_url else json.dumps([])
+
+
+def sync_seller_product_to_storefront(seller_product):
+    if not seller_product or seller_product.get("status") == "draft":
+        return None
+
+    seller_id = seller_product.get("seller_id")
+    supplier = get_seller_store_name(seller_id)
+    name = seller_product.get("name") or "Seller product"
+    price = seller_product.get("price") or 0
+    stock = seller_product.get("stock") or 0
+    category = seller_product.get("category") or "Marketplace"
+    description = seller_product.get("description") or ""
+    image_json = product_images_json(seller_product.get("image_url"))
+    existing_product_id = seller_product.get("storefront_product_id")
+
+    if existing_product_id:
+        execute(
+            """
+            UPDATE product
+            SET item=%s, category=%s, subcategory=%s, price=%s, old_price=%s, discount=0,
+                description=%s, supplier=%s, img=%s, qty=%s, stock=%s
+            WHERE id=%s
+            """,
+            (
+                name,
+                category,
+                "",
+                price,
+                price,
+                description,
+                supplier,
+                image_json,
+                stock,
+                stock,
+                existing_product_id,
+            ),
+        )
+        return existing_product_id
+
+    storefront_product_id = execute(
+        """
+        INSERT INTO product
+            (item, category, subcategory, price, old_price, discount, description, supplier, img, qty, stock, date)
+        VALUES (%s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s, NOW())
+        """,
+        (name, category, "", price, price, description, supplier, image_json, stock, stock),
+    )
+    execute(
+        "UPDATE seller_products SET storefront_product_id=%s WHERE id=%s AND seller_id=%s",
+        (storefront_product_id, seller_product.get("id"), seller_id),
+    )
+    return storefront_product_id
+
+
+def remove_seller_product_from_storefront(seller_product):
+    storefront_product_id = (seller_product or {}).get("storefront_product_id")
+    if storefront_product_id:
+        execute("DELETE FROM product WHERE id=%s", (storefront_product_id,))
 
 
 def load_seller_from_token():
@@ -378,6 +449,10 @@ def get_products():
         params.append(status)
 
     sql += " ORDER BY id DESC"
+    products = query(sql, params)
+    for product in products:
+        if not product.get("storefront_product_id") and product.get("status") != "draft":
+            sync_seller_product_to_storefront(product)
     return jsonify({"success": True, "data": query(sql, params)})
 
 
@@ -401,6 +476,8 @@ def create_product():
         (seller_id, name, description, price, stock, category, status, image_url),
     )
     product = query_one("SELECT * FROM seller_products WHERE id=%s AND seller_id=%s", (product_id, seller_id))
+    sync_seller_product_to_storefront(product)
+    product = query_one("SELECT * FROM seller_products WHERE id=%s AND seller_id=%s", (product_id, seller_id))
     return jsonify({"success": True, "data": product})
 
 
@@ -423,6 +500,12 @@ def update_product(pid):
         "UPDATE seller_products SET name=%s, description=%s, price=%s, stock=%s, category=%s, status=%s, image_url=%s WHERE id=%s AND seller_id=%s",
         (name, description, price, stock, category, status, image_url, pid, seller_id),
     )
+    product = query_one("SELECT * FROM seller_products WHERE id=%s AND seller_id=%s", (pid, seller_id))
+    if product and status == "draft":
+        remove_seller_product_from_storefront(product)
+        execute("UPDATE seller_products SET storefront_product_id=NULL WHERE id=%s AND seller_id=%s", (pid, seller_id))
+    else:
+        sync_seller_product_to_storefront(product)
     return jsonify({"success": True})
 
 
@@ -432,6 +515,8 @@ def delete_product(pid):
     if not seller_id:
         return jsonify({"error": "Unauthorized"}), 401
 
+    product = query_one("SELECT * FROM seller_products WHERE id=%s AND seller_id=%s", (pid, seller_id))
+    remove_seller_product_from_storefront(product)
     execute("DELETE FROM seller_products WHERE id=%s AND seller_id=%s", (pid, seller_id))
     return jsonify({"success": True})
 
