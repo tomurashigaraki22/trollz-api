@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 import bcrypt
 from flask import Blueprint, request, jsonify
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
-from lib.db import DB_CONFIG, query, query_one, execute
+from lib.db import query, query_one, execute
 from lib.cloudinary_helper import upload_image
 
 seller_bp = Blueprint("seller", __name__)
@@ -147,6 +147,53 @@ def get_seller_id():
     return None
 
 
+def percent(numerator, denominator):
+    numerator = float(numerator or 0)
+    denominator = float(denominator or 0)
+    if denominator <= 0:
+        return 0
+    return round((numerator / denominator) * 100, 1)
+
+
+def get_seller_rating_summary(seller_id):
+    try:
+        if not column_exists("product_reviews", "rating"):
+            return {"average_rating": 0, "rating_count": 0}
+
+        if column_exists("product", "seller_id"):
+            rating = query_one(
+                """
+                SELECT COALESCE(AVG(pr.rating), 0) AS average_rating, COUNT(*) AS rating_count
+                FROM product_reviews pr
+                JOIN product p ON p.id = pr.product_id
+                WHERE p.seller_id = %s
+                """,
+                (seller_id,),
+            )
+            return {
+                "average_rating": round(float(rating["average_rating"] or 0), 1) if rating else 0,
+                "rating_count": int(rating["rating_count"] or 0) if rating else 0,
+            }
+
+        if column_exists("product_reviews", "seller_id"):
+            rating = query_one(
+                """
+                SELECT COALESCE(AVG(rating), 0) AS average_rating, COUNT(*) AS rating_count
+                FROM product_reviews
+                WHERE seller_id = %s
+                """,
+                (seller_id,),
+            )
+            return {
+                "average_rating": round(float(rating["average_rating"] or 0), 1) if rating else 0,
+                "rating_count": int(rating["rating_count"] or 0) if rating else 0,
+            }
+    except Exception as exc:
+        print("Unable to calculate seller ratings:", exc)
+
+    return {"average_rating": 0, "rating_count": 0}
+
+
 def create_default_seller():
     try:
         if not column_exists("users", "email") or not column_exists("users", "name"):
@@ -180,84 +227,6 @@ def initialize_seller_module():
     create_default_seller()
 
 
-def password_kind(value):
-    if not value:
-        return "missing"
-    if is_bcrypt_hash(value):
-        return "bcrypt"
-    return "plain"
-
-
-def public_user_debug(user):
-    if not user:
-        return {"exists": False}
-
-    password = user.get("password")
-    return {
-        "exists": True,
-        "id": user.get("id"),
-        "seller_id": user.get("seller_id"),
-        "email": user.get("email"),
-        "name": user.get("name"),
-        "role": user.get("role"),
-        "status": user.get("status"),
-        "password_kind": password_kind(password),
-        "password_prefix": password[:7] if password else None,
-        "password_length": len(password) if password else 0,
-    }
-
-
-@seller_bp.route("/debug-auth", methods=["POST"])
-def debug_auth():
-    data = request.get_json(silent=True) or {}
-    email = (data.get("email") or "").strip()
-    password = data.get("password") or ""
-
-    db_status = query_one("SELECT DATABASE() AS db_name, USER() AS db_user, @@hostname AS db_hostname")
-    table_counts = query_one(
-        """
-        SELECT
-            (SELECT COUNT(*) FROM users) AS users_count,
-            (SELECT COUNT(*) FROM users WHERE role='Seller') AS sellers_count,
-            (SELECT COUNT(*) FROM seller_team) AS seller_team_count
-        """
-    )
-
-    user = None
-    team_user = None
-    if email:
-        user = query_one(
-            "SELECT id, email, name, password, role, status FROM users WHERE LOWER(email)=LOWER(%s) LIMIT 1",
-            (email,),
-        )
-        team_user = query_one(
-            "SELECT id, seller_id, email, name, password, role FROM seller_team WHERE LOWER(email)=LOWER(%s) LIMIT 1",
-            (email,),
-        )
-
-    verification = {
-        "password_was_sent": bool(password),
-        "users_password_matches": verify_password(user, password, "users") if user and password else False,
-        "seller_team_password_matches": verify_password(team_user, password, "seller_team") if team_user and password else False,
-    }
-
-    return jsonify({
-        "success": True,
-        "api_db_config": {
-            "host": DB_CONFIG.get("host"),
-            "port": DB_CONFIG.get("port"),
-            "database": DB_CONFIG.get("database"),
-            "user": DB_CONFIG.get("user"),
-        },
-        "connected_database": db_status,
-        "table_counts": table_counts,
-        "lookup_email": email,
-        "users_table": public_user_debug(user),
-        "seller_team_table": public_user_debug(team_user),
-        "verification": verification,
-    })
-
-
 @seller_bp.route("/login", methods=["POST"])
 def login():
     data = request.get_json(silent=True) or {}
@@ -282,19 +251,7 @@ def login():
 
     password_matches = verify_password(user, password, user_table) if user else False
     if not user or not password_matches:
-        return jsonify({
-            "error": "Invalid credentials",
-            "debug": {
-                "email_received": email,
-                "password_length_received": len(password),
-                "user_found": bool(user),
-                "user_table": user_table,
-                "password_kind": password_kind(user.get("password")) if user else None,
-                "password_prefix": user.get("password", "")[:7] if user else None,
-                "password_length_stored": len(user.get("password", "")) if user else 0,
-                "password_matches": password_matches,
-            },
-        }), 401
+        return jsonify({"error": "Invalid credentials"}), 401
 
     if user.get("role") not in SELLER_ROLES:
         return jsonify({"error": "Not authorized"}), 403
@@ -327,6 +284,40 @@ def dashboard():
     low_stock = query_one("SELECT COUNT(*) as count FROM seller_products WHERE seller_id=%s AND stock <= 5", (seller_id,))
     total_orders = query_one("SELECT COUNT(*) as count FROM seller_orders WHERE seller_id=%s", (seller_id,))
     total_sales = query_one("SELECT COALESCE(SUM(total_amount), 0) as total FROM seller_orders WHERE seller_id=%s AND payment_status='paid'", (seller_id,))
+    paid_orders = query_one("SELECT COUNT(*) as count FROM seller_orders WHERE seller_id=%s AND payment_status='paid'", (seller_id,))
+    cancelled_orders = query_one("SELECT COUNT(*) as count FROM seller_orders WHERE seller_id=%s AND order_status='cancelled'", (seller_id,))
+    delivered_orders = query_one("SELECT COUNT(*) as count FROM seller_orders WHERE seller_id=%s AND order_status IN ('delivered', 'completed')", (seller_id,))
+    monthly_sales = query_one(
+        "SELECT COALESCE(SUM(total_amount), 0) as total FROM seller_orders WHERE seller_id=%s AND payment_status='paid' AND created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)",
+        (seller_id,),
+    )
+    monthly_orders = query_one(
+        "SELECT COUNT(*) as count FROM seller_orders WHERE seller_id=%s AND created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)",
+        (seller_id,),
+    )
+
+    product_views = {"total": 0}
+    if column_exists("seller_products", "views"):
+        product_views = query_one("SELECT COALESCE(SUM(views), 0) as total FROM seller_products WHERE seller_id=%s", (seller_id,)) or {"total": 0}
+
+    total_orders_count = int(total_orders["count"] or 0) if total_orders else 0
+    paid_orders_count = int(paid_orders["count"] or 0) if paid_orders else 0
+    cancelled_orders_count = int(cancelled_orders["count"] or 0) if cancelled_orders else 0
+    delivered_orders_count = int(delivered_orders["count"] or 0) if delivered_orders else 0
+    views_count = int(product_views["total"] or 0) if product_views else 0
+    conversion_denominator = views_count if views_count > 0 else total_orders_count
+    ratings = get_seller_rating_summary(seller_id)
+    monthly_sales_total = float(monthly_sales["total"] or 0) if monthly_sales else 0
+    monthly_orders_count = int(monthly_orders["count"] or 0) if monthly_orders else 0
+    cancellation_rate = percent(cancelled_orders_count, total_orders_count)
+    conversion_rate = percent(paid_orders_count, conversion_denominator)
+    fulfillment_rate = percent(delivered_orders_count, total_orders_count)
+    is_top_seller = (
+        monthly_sales_total >= 100000
+        and monthly_orders_count >= 10
+        and cancellation_rate <= 5
+        and (ratings["average_rating"] >= 4.5 or ratings["rating_count"] == 0)
+    )
 
     recent_orders = query(
         "SELECT id, order_number, buyer_name, total_amount, order_status, payment_status, created_at FROM seller_orders WHERE seller_id=%s ORDER BY created_at DESC LIMIT 5",
@@ -350,6 +341,16 @@ def dashboard():
                 "low_stock_products": low_stock["count"] if low_stock else 0,
                 "total_orders": total_orders["count"] if total_orders else 0,
                 "total_sales": float(total_sales["total"]) if total_sales else 0,
+                "paid_orders": paid_orders_count,
+                "monthly_sales": monthly_sales_total,
+                "monthly_orders": monthly_orders_count,
+                "conversion_rate": conversion_rate,
+                "cancellation_rate": cancellation_rate,
+                "fulfillment_rate": fulfillment_rate,
+                "average_rating": ratings["average_rating"],
+                "rating_count": ratings["rating_count"],
+                "top_seller_badge": is_top_seller,
+                "badge_label": "Top Seller" if is_top_seller else "Growing Seller",
             },
             "recent_orders": recent_orders,
             "orders_chart": orders_chart,
