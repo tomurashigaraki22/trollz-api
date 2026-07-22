@@ -52,6 +52,7 @@ def ensure_seller_tables():
                 price DECIMAL(12,2) NOT NULL DEFAULT 0.00,
                 stock INT NOT NULL DEFAULT 0,
                 category VARCHAR(128),
+                subcategory VARCHAR(128),
                 status VARCHAR(50) DEFAULT 'active',
                 image_url TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -95,6 +96,8 @@ def ensure_seller_tables():
 
         if not column_exists("seller_products", "storefront_product_id"):
             execute("ALTER TABLE seller_products ADD COLUMN storefront_product_id INT NULL")
+        if not column_exists("seller_products", "subcategory"):
+            execute("ALTER TABLE seller_products ADD COLUMN subcategory VARCHAR(128) NULL")
     except Exception as exc:
         print("Unable to create seller tables:", exc)
 
@@ -105,11 +108,42 @@ def get_seller_store_name(seller_id):
 
 
 def product_images_json(image_url):
-    return json.dumps([image_url]) if image_url else json.dumps([])
+    if not image_url:
+        return json.dumps([])
+    if isinstance(image_url, list):
+        return json.dumps([url for url in image_url if url])
+    if isinstance(image_url, str):
+        value = image_url.strip()
+        if not value:
+            return json.dumps([])
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return json.dumps([url for url in parsed if url])
+        except Exception:
+            pass
+        return json.dumps([value])
+    return json.dumps([])
 
 
-def resolve_storefront_category(category_name):
+def resolve_storefront_category(category_name, subcategory_name=None):
     category = (category_name or "").strip()
+    subcategory = (subcategory_name or "").strip()
+    if subcategory:
+        existing = query_one(
+            "SELECT id, category, parent_id FROM category WHERE LOWER(category)=LOWER(%s) LIMIT 1",
+            (subcategory,),
+        )
+        if existing and existing.get("parent_id"):
+            parent = query_one("SELECT id, category FROM category WHERE id=%s LIMIT 1", (existing["parent_id"],))
+            if not category or (parent and parent.get("category", "").lower() == category.lower()):
+                return {
+                    "category": (parent or existing).get("category"),
+                    "category_id": (parent or existing).get("id"),
+                    "subcategory": existing.get("category"),
+                    "subcategory_id": existing.get("id"),
+                }
+
     if category:
         existing = query_one(
             "SELECT id, category, parent_id FROM category WHERE LOWER(category)=LOWER(%s) LIMIT 1",
@@ -151,7 +185,7 @@ def sync_seller_product_to_storefront(seller_product):
     name = seller_product.get("name") or "Seller product"
     price = seller_product.get("price") or 0
     stock = seller_product.get("stock") or 0
-    category_info = resolve_storefront_category(seller_product.get("category"))
+    category_info = resolve_storefront_category(seller_product.get("category"), seller_product.get("subcategory"))
     description = seller_product.get("description") or ""
     image_json = product_images_json(seller_product.get("image_url"))
     existing_product_id = seller_product.get("storefront_product_id")
@@ -522,13 +556,14 @@ def create_product():
     price = data.get("price") or 0
     stock = data.get("stock") or data.get("qty") or 0
     category = data.get("category")
+    subcategory = data.get("subcategory")
     description = data.get("description")
     status = data.get("status") or "active"
-    image_url = data.get("image_url") or data.get("img")
+    image_url = data.get("image_url") or data.get("image_urls") or data.get("img")
 
     product_id = execute(
-        "INSERT INTO seller_products (seller_id, name, description, price, stock, category, status, image_url) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-        (seller_id, name, description, price, stock, category, status, image_url),
+        "INSERT INTO seller_products (seller_id, name, description, price, stock, category, subcategory, status, image_url) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (seller_id, name, description, price, stock, category, subcategory, status, product_images_json(image_url)),
     )
     product = query_one("SELECT * FROM seller_products WHERE id=%s AND seller_id=%s", (product_id, seller_id))
     sync_seller_product_to_storefront(product)
@@ -547,13 +582,14 @@ def update_product(pid):
     price = data.get("price") or 0
     stock = data.get("stock") or data.get("qty") or 0
     category = data.get("category")
+    subcategory = data.get("subcategory")
     description = data.get("description")
     status = data.get("status") or "active"
-    image_url = data.get("image_url") or data.get("img")
+    image_url = data.get("image_url") or data.get("image_urls") or data.get("img")
 
     execute(
-        "UPDATE seller_products SET name=%s, description=%s, price=%s, stock=%s, category=%s, status=%s, image_url=%s WHERE id=%s AND seller_id=%s",
-        (name, description, price, stock, category, status, image_url, pid, seller_id),
+        "UPDATE seller_products SET name=%s, description=%s, price=%s, stock=%s, category=%s, subcategory=%s, status=%s, image_url=%s WHERE id=%s AND seller_id=%s",
+        (name, description, price, stock, category, subcategory, status, product_images_json(image_url), pid, seller_id),
     )
     product = query_one("SELECT * FROM seller_products WHERE id=%s AND seller_id=%s", (pid, seller_id))
     if product and status == "draft":
