@@ -94,6 +94,44 @@ def ensure_seller_tables():
             """,
         )
 
+        execute(
+            """
+            CREATE TABLE IF NOT EXISTS seller_delivery_settings (
+                seller_id INT PRIMARY KEY,
+                pickup_zone_id INT NULL,
+                pickup_address TEXT,
+                handling_time_days INT NOT NULL DEFAULT 1,
+                same_day_pickup TINYINT(1) NOT NULL DEFAULT 0,
+                dropoff_supported TINYINT(1) NOT NULL DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+        )
+
+        execute(
+            """
+            CREATE TABLE IF NOT EXISTS delivery_zones (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                name VARCHAR(120) NOT NULL,
+                state VARCHAR(120),
+                cities TEXT,
+                base_fee DECIMAL(12,2) NOT NULL DEFAULT 0,
+                express_fee DECIMAL(12,2) NOT NULL DEFAULT 0,
+                extra_seller_fee DECIMAL(12,2) NOT NULL DEFAULT 0,
+                inter_zone_fee DECIMAL(12,2) NOT NULL DEFAULT 0,
+                batch_discount DECIMAL(12,2) NOT NULL DEFAULT 0,
+                free_delivery_threshold DECIMAL(12,2) NOT NULL DEFAULT 0,
+                standard_min_days INT NOT NULL DEFAULT 1,
+                standard_max_days INT NOT NULL DEFAULT 3,
+                express_min_days INT NOT NULL DEFAULT 0,
+                express_max_days INT NOT NULL DEFAULT 1,
+                is_active TINYINT(1) NOT NULL DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+        )
+
         if not column_exists("seller_products", "storefront_product_id"):
             execute("ALTER TABLE seller_products ADD COLUMN storefront_product_id INT NULL")
         if not column_exists("seller_products", "subcategory"):
@@ -706,6 +744,57 @@ def analytics():
             "top_products": top_products,
         },
     })
+
+
+@seller_bp.route("/delivery-settings", methods=["GET"])
+def get_delivery_settings():
+    seller_id = get_seller_id()
+    if not seller_id:
+        return jsonify({"error": "Unauthorized"}), 401
+    ensure_seller_tables()
+    zones = query("SELECT id, name, state, cities FROM delivery_zones WHERE is_active=1 ORDER BY name")
+    settings = query_one(
+        "SELECT * FROM seller_delivery_settings WHERE seller_id=%s LIMIT 1",
+        (seller_id,),
+    ) or {
+        "seller_id": seller_id,
+        "pickup_zone_id": None,
+        "pickup_address": "",
+        "handling_time_days": 1,
+        "same_day_pickup": 0,
+        "dropoff_supported": 0,
+    }
+    return jsonify({"success": True, "data": {"settings": settings, "zones": zones}})
+
+
+@seller_bp.route("/delivery-settings", methods=["PUT"])
+def update_delivery_settings():
+    seller_id = get_seller_id()
+    if not seller_id:
+        return jsonify({"error": "Unauthorized"}), 401
+    ensure_seller_tables()
+    data = request.get_json(force=True) or {}
+    pickup_zone_id = data.get("pickup_zone_id") or None
+    pickup_address = data.get("pickup_address") or ""
+    handling_time_days = max(0, int(data.get("handling_time_days") or 1))
+    same_day_pickup = 1 if data.get("same_day_pickup") else 0
+    dropoff_supported = 1 if data.get("dropoff_supported") else 0
+    execute(
+        """
+        INSERT INTO seller_delivery_settings
+            (seller_id, pickup_zone_id, pickup_address, handling_time_days, same_day_pickup, dropoff_supported)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+            pickup_zone_id=VALUES(pickup_zone_id),
+            pickup_address=VALUES(pickup_address),
+            handling_time_days=VALUES(handling_time_days),
+            same_day_pickup=VALUES(same_day_pickup),
+            dropoff_supported=VALUES(dropoff_supported)
+        """,
+        (seller_id, pickup_zone_id, pickup_address, handling_time_days, same_day_pickup, dropoff_supported),
+    )
+    settings = query_one("SELECT * FROM seller_delivery_settings WHERE seller_id=%s LIMIT 1", (seller_id,))
+    return jsonify({"success": True, "data": {"settings": settings}})
 
 
 @seller_bp.route("/team", methods=["GET"])
