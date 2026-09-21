@@ -136,6 +136,16 @@ def ensure_seller_tables():
             execute("ALTER TABLE seller_products ADD COLUMN storefront_product_id INT NULL")
         if not column_exists("seller_products", "subcategory"):
             execute("ALTER TABLE seller_products ADD COLUMN subcategory VARCHAR(128) NULL")
+        for column, definition in (
+            ("size_type", "VARCHAR(50) NULL"),
+            ("size_options", "TEXT NULL"),
+            ("color_options", "TEXT NULL"),
+            ("attributes", "TEXT NULL"),
+        ):
+            if not column_exists("seller_products", column):
+                execute(f"ALTER TABLE seller_products ADD COLUMN {column} {definition}")
+        if not column_exists("product", "attributes"):
+            execute("ALTER TABLE product ADD COLUMN attributes TEXT NULL")
     except Exception as exc:
         print("Unable to create seller tables:", exc)
 
@@ -162,6 +172,30 @@ def product_images_json(image_url):
             pass
         return json.dumps([value])
     return json.dumps([])
+
+
+def json_list(value):
+    if isinstance(value, list):
+        return [item for item in value if item]
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return [item for item in parsed if item] if isinstance(parsed, list) else []
+        except Exception:
+            return []
+    return []
+
+
+def json_object(value):
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
 
 
 def resolve_storefront_category(category_name, subcategory_name=None):
@@ -226,6 +260,11 @@ def sync_seller_product_to_storefront(seller_product):
     category_info = resolve_storefront_category(seller_product.get("category"), seller_product.get("subcategory"))
     description = seller_product.get("description") or ""
     image_json = product_images_json(seller_product.get("image_url"))
+    size_type = seller_product.get("size_type") or "none"
+    size_options = product_images_json(seller_product.get("size_options"))
+    color_options = product_images_json(seller_product.get("color_options"))
+    raw_attributes = seller_product.get("attributes") or {}
+    attributes = raw_attributes if isinstance(raw_attributes, str) else json.dumps(raw_attributes)
     existing_product_id = seller_product.get("storefront_product_id")
 
     if existing_product_id:
@@ -234,7 +273,8 @@ def sync_seller_product_to_storefront(seller_product):
             UPDATE product
             SET item=%s, category=%s, subcategory=%s, parent_category_id=%s, subcategory_id=%s,
                 category_id=%s, price=%s, old_price=%s, discount=0,
-                description=%s, supplier=%s, img=%s, qty=%s, stock=%s, new=%s
+                description=%s, supplier=%s, img=%s, qty=%s, stock=%s, new=%s,
+                size_type=%s, size_options=%s, color_options=%s, attributes=%s
             WHERE id=%s
             """,
             (
@@ -252,6 +292,10 @@ def sync_seller_product_to_storefront(seller_product):
                 stock,
                 stock,
                 1,
+                size_type,
+                size_options,
+                color_options,
+                attributes,
                 existing_product_id,
             ),
         )
@@ -261,8 +305,9 @@ def sync_seller_product_to_storefront(seller_product):
         """
         INSERT INTO product
             (item, category, subcategory, parent_category_id, subcategory_id, category_id,
-             price, old_price, discount, description, supplier, new, img, qty, stock, date)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s, %s, NOW())
+             price, old_price, discount, description, supplier, new, img, qty, stock,
+             size_type, size_options, color_options, attributes, date)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s, %s, NOW())
         """,
         (
             name,
@@ -279,6 +324,10 @@ def sync_seller_product_to_storefront(seller_product):
             image_json,
             stock,
             stock,
+            size_type,
+            size_options,
+            color_options,
+            attributes,
         ),
     )
     execute(
@@ -312,6 +361,7 @@ def create_token(user):
         "email": user.get("email"),
         "name": user.get("name"),
         "role": user.get("role"),
+        "onboarding_required": str(user.get("status", 1)) in ("0", "False", "false"),
     }
     return _serializer.dumps(payload)
 
@@ -341,7 +391,13 @@ def verify_password(user, password, table_name=None):
 def get_seller_id():
     token_data = load_seller_from_token()
     if token_data and token_data.get("seller_id"):
-        return token_data["seller_id"]
+        seller = query_one(
+            "SELECT id, status FROM users WHERE id=%s AND role='Seller' LIMIT 1",
+            (token_data["seller_id"],),
+        )
+        if not seller or str(seller.get("status", 1)) in ("0", "False", "false"):
+            return None
+        return seller["id"]
     return None
 
 
@@ -454,14 +510,13 @@ def login():
     if user.get("role") not in SELLER_ROLES:
         return jsonify({"error": "Not authorized"}), 403
 
-    if user_table == "users" and str(user.get("status", 1)) in ("0", "False", "false"):
-        return jsonify({"error": "Seller account is inactive"}), 403
-
     token = create_token(user)
+    onboarding_required = user_table == "users" and str(user.get("status", 1)) in ("0", "False", "false")
     return jsonify({
         "success": True,
         "data": {
             "token": token,
+            "onboarding_required": onboarding_required,
             "seller": {
                 "id": user.get("id"),
                 "name": user.get("name"),
@@ -598,10 +653,14 @@ def create_product():
     description = data.get("description")
     status = data.get("status") or "active"
     image_url = data.get("image_url") or data.get("image_urls") or data.get("img")
+    size_options = json_list(data.get("size_options") or data.get("sizeOptions"))
+    color_options = json_list(data.get("color_options") or data.get("colorOptions"))
+    attributes = json_object(data.get("attributes"))
+    size_type = data.get("size_type") or ("custom" if size_options else "none")
 
     product_id = execute(
-        "INSERT INTO seller_products (seller_id, name, description, price, stock, category, subcategory, status, image_url) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-        (seller_id, name, description, price, stock, category, subcategory, status, product_images_json(image_url)),
+        "INSERT INTO seller_products (seller_id, name, description, price, stock, category, subcategory, status, image_url, size_type, size_options, color_options, attributes) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (seller_id, name, description, price, stock, category, subcategory, status, product_images_json(image_url), size_type, json.dumps(size_options), json.dumps(color_options), json.dumps(attributes)),
     )
     product = query_one("SELECT * FROM seller_products WHERE id=%s AND seller_id=%s", (product_id, seller_id))
     sync_seller_product_to_storefront(product)
@@ -624,10 +683,14 @@ def update_product(pid):
     description = data.get("description")
     status = data.get("status") or "active"
     image_url = data.get("image_url") or data.get("image_urls") or data.get("img")
+    size_options = json_list(data.get("size_options") or data.get("sizeOptions"))
+    color_options = json_list(data.get("color_options") or data.get("colorOptions"))
+    attributes = json_object(data.get("attributes"))
+    size_type = data.get("size_type") or ("custom" if size_options else "none")
 
     execute(
-        "UPDATE seller_products SET name=%s, description=%s, price=%s, stock=%s, category=%s, subcategory=%s, status=%s, image_url=%s WHERE id=%s AND seller_id=%s",
-        (name, description, price, stock, category, subcategory, status, product_images_json(image_url), pid, seller_id),
+        "UPDATE seller_products SET name=%s, description=%s, price=%s, stock=%s, category=%s, subcategory=%s, status=%s, image_url=%s, size_type=%s, size_options=%s, color_options=%s, attributes=%s WHERE id=%s AND seller_id=%s",
+        (name, description, price, stock, category, subcategory, status, product_images_json(image_url), size_type, json.dumps(size_options), json.dumps(color_options), json.dumps(attributes), pid, seller_id),
     )
     product = query_one("SELECT * FROM seller_products WHERE id=%s AND seller_id=%s", (pid, seller_id))
     if product and status == "draft":
