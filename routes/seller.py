@@ -3,6 +3,7 @@ import json
 import uuid
 from datetime import datetime, timedelta
 import bcrypt
+import requests
 from flask import Blueprint, request, jsonify
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from lib.db import query, query_one, execute
@@ -128,6 +129,50 @@ def ensure_seller_tables():
                 is_active TINYINT(1) NOT NULL DEFAULT 1,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+        )
+
+        execute(
+            """
+            CREATE TABLE IF NOT EXISTS seller_banner_ad_plans (
+                code VARCHAR(32) PRIMARY KEY,
+                name VARCHAR(80) NOT NULL,
+                duration_days INT NOT NULL,
+                price DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+                is_active TINYINT(1) NOT NULL DEFAULT 1,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+        )
+        execute(
+            """
+            INSERT IGNORE INTO seller_banner_ad_plans (code, name, duration_days, price, is_active)
+            VALUES
+                ('monthly', 'Monthly', 30, 0.00, 1),
+                ('quarterly', 'Quarterly (3 months)', 90, 0.00, 1),
+                ('yearly', 'Yearly', 365, 0.00, 1)
+            """,
+        )
+        execute(
+            """
+            CREATE TABLE IF NOT EXISTS seller_banner_ads (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                seller_id INT NOT NULL,
+                plan_code VARCHAR(32) NOT NULL,
+                amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+                image_url TEXT NOT NULL,
+                target_url TEXT NULL,
+                tx_ref VARCHAR(160) NOT NULL UNIQUE,
+                transaction_id VARCHAR(100) NULL,
+                payment_status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                starts_at DATETIME NULL,
+                expires_at DATETIME NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                KEY idx_seller_banner_ads_seller (seller_id, status),
+                KEY idx_seller_banner_ads_live (status, payment_status, starts_at, expires_at)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """,
         )
@@ -398,6 +443,30 @@ def get_seller_id():
         if not seller or str(seller.get("status", 1)) in ("0", "False", "false"):
             return None
         return seller["id"]
+    return None
+
+
+def serialize_banner_ad(row):
+    if not row:
+        return row
+    result = dict(row)
+    for key in ("amount",):
+        if result.get(key) is not None:
+            result[key] = float(result[key])
+    for key in ("created_at", "updated_at", "starts_at", "expires_at"):
+        if result.get(key):
+            result[key] = str(result[key])
+    return result
+
+
+def valid_http_url(value):
+    if not value:
+        return None
+    text = str(value).strip()
+    if len(text) > 2048:
+        return None
+    if text.startswith(("https://", "http://")):
+        return text
     return None
 
 
@@ -858,6 +927,208 @@ def update_delivery_settings():
     )
     settings = query_one("SELECT * FROM seller_delivery_settings WHERE seller_id=%s LIMIT 1", (seller_id,))
     return jsonify({"success": True, "data": {"settings": settings}})
+
+
+@seller_bp.route("/banner-ads/plans", methods=["GET"])
+def get_banner_ad_plans():
+    ensure_seller_tables()
+    plans = query(
+        "SELECT code, name, duration_days, price FROM seller_banner_ad_plans WHERE is_active=1 ORDER BY duration_days"
+    )
+    for plan in plans:
+        plan["price"] = float(plan.get("price") or 0)
+        plan["duration_days"] = int(plan.get("duration_days") or 0)
+    return jsonify({"success": True, "data": {"plans": plans}})
+
+
+@seller_bp.route("/banner-ads", methods=["GET"])
+def get_seller_banner_ads():
+    seller_id = get_seller_id()
+    if not seller_id:
+        return jsonify({"error": "Unauthorized"}), 401
+    ensure_seller_tables()
+    ads = query(
+        """
+        SELECT a.*, p.name AS plan_name, p.duration_days
+        FROM seller_banner_ads a
+        JOIN seller_banner_ad_plans p ON p.code = a.plan_code
+        WHERE a.seller_id=%s
+        ORDER BY a.created_at DESC, a.id DESC
+        """,
+        (seller_id,),
+    )
+    return jsonify({"success": True, "data": {"ads": [serialize_banner_ad(ad) for ad in ads]}})
+
+
+@seller_bp.route("/banner-ads/upload", methods=["POST"])
+def upload_banner_ad_image():
+    seller_id = get_seller_id()
+    if not seller_id:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    image = request.files.get("image")
+    if not image or not image.filename:
+        return jsonify({"error": "Banner image is required"}), 400
+
+    allowed_types = {"image/jpeg", "image/png", "image/webp", "image/avif"}
+    if image.mimetype not in allowed_types:
+        return jsonify({"error": "Use a JPEG, PNG, WEBP, or AVIF image"}), 400
+    if request.content_length and request.content_length > 5 * 1024 * 1024:
+        return jsonify({"error": "Banner image must be smaller than 5MB"}), 400
+
+    try:
+        url = upload_image(image.stream, "trollz/seller/banner-ads")
+        return jsonify({"success": True, "data": {"url": url}})
+    except Exception as exc:
+        print("Unable to upload seller banner image:", exc)
+        return jsonify({"error": "Banner image upload failed"}), 502
+
+
+@seller_bp.route("/banner-ads/checkout", methods=["POST"])
+def create_banner_ad_checkout():
+    seller_id = get_seller_id()
+    if not seller_id:
+        return jsonify({"error": "Unauthorized"}), 401
+    ensure_seller_tables()
+
+    data = request.get_json(silent=True) or {}
+    plan_code = str(data.get("plan_code") or "").strip().lower()
+    image_url = valid_http_url(data.get("image_url"))
+    target_url = valid_http_url(data.get("target_url")) if data.get("target_url") else None
+    if not plan_code:
+        return jsonify({"error": "Choose an advertising period"}), 400
+    if not image_url:
+        return jsonify({"error": "Upload a banner image before paying"}), 400
+    if data.get("target_url") and not target_url:
+        return jsonify({"error": "The destination URL must start with http:// or https://"}), 400
+
+    plan = query_one(
+        "SELECT code, name, duration_days, price FROM seller_banner_ad_plans WHERE code=%s AND is_active=1 LIMIT 1",
+        (plan_code,),
+    )
+    if not plan:
+        return jsonify({"error": "That advertising period is unavailable"}), 400
+    amount = float(plan.get("price") or 0)
+    if amount <= 0:
+        return jsonify({"error": "This advertising period has not been priced by the admin yet"}), 409
+
+    seller = query_one("SELECT id, name, email, phone FROM users WHERE id=%s AND role='Seller' LIMIT 1", (seller_id,))
+    secret_key = os.getenv("FLUTTERWAVE_SECRET_KEY")
+    if not seller or not secret_key:
+        return jsonify({"error": "Banner advertising payments are not configured yet"}), 503
+
+    tx_ref = f"TROLLZ_BANNER_{seller_id}_{uuid.uuid4().hex}"
+    execute(
+        """
+        INSERT INTO seller_banner_ads
+            (seller_id, plan_code, amount, image_url, target_url, tx_ref, payment_status, status)
+        VALUES (%s, %s, %s, %s, %s, %s, 'pending', 'pending')
+        """,
+        (seller_id, plan_code, amount, image_url, target_url, tx_ref),
+    )
+
+    redirect_url = os.getenv(
+        "SELLER_BANNER_AD_REDIRECT_URL",
+        "https://seller.trollzstore.com.ng/dashboard/banner-ads/payment",
+    )
+    try:
+        response = requests.post(
+            "https://api.flutterwave.com/v3/payments",
+            headers={"Authorization": f"Bearer {secret_key}", "Content-Type": "application/json"},
+            json={
+                "tx_ref": tx_ref,
+                "amount": amount,
+                "currency": "NGN",
+                "redirect_url": redirect_url,
+                "customer": {
+                    "email": seller.get("email"),
+                    "name": seller.get("name"),
+                    "phonenumber": seller.get("phone") or "",
+                },
+                "customizations": {
+                    "title": "Trollz Store Seller Banner Ad",
+                    "description": f"{plan.get('name')} homepage banner advertising",
+                },
+            },
+            timeout=20,
+        )
+        payload = response.json()
+    except Exception as exc:
+        execute("UPDATE seller_banner_ads SET payment_status='failed', status='failed' WHERE tx_ref=%s", (tx_ref,))
+        print("Unable to initialize seller banner payment:", exc)
+        return jsonify({"error": "Unable to start payment right now"}), 502
+
+    if response.status_code >= 400 or payload.get("status") != "success" or not payload.get("data", {}).get("link"):
+        execute("UPDATE seller_banner_ads SET payment_status='failed', status='failed' WHERE tx_ref=%s", (tx_ref,))
+        return jsonify({"error": payload.get("message") or "Unable to start payment right now"}), 502
+
+    return jsonify({
+        "success": True,
+        "data": {"payment_link": payload["data"]["link"], "tx_ref": tx_ref, "amount": amount},
+    })
+
+
+@seller_bp.route("/banner-ads/verify", methods=["POST"])
+def verify_banner_ad_payment():
+    seller_id = get_seller_id()
+    if not seller_id:
+        return jsonify({"error": "Unauthorized"}), 401
+    ensure_seller_tables()
+
+    data = request.get_json(silent=True) or {}
+    tx_ref = str(data.get("tx_ref") or "").strip()
+    if not tx_ref:
+        return jsonify({"error": "Payment reference is required"}), 400
+
+    ad = query_one(
+        "SELECT * FROM seller_banner_ads WHERE tx_ref=%s AND seller_id=%s LIMIT 1",
+        (tx_ref, seller_id),
+    )
+    if not ad:
+        return jsonify({"error": "Banner ad payment was not found"}), 404
+    if ad.get("payment_status") == "paid" and ad.get("status") == "active":
+        return jsonify({"success": True, "data": {"ad": serialize_banner_ad(ad)}})
+
+    secret_key = os.getenv("FLUTTERWAVE_SECRET_KEY")
+    if not secret_key:
+        return jsonify({"error": "Payment verification is not configured"}), 503
+    try:
+        response = requests.get(
+            "https://api.flutterwave.com/v3/transactions/verify_by_reference",
+            params={"tx_ref": tx_ref},
+            headers={"Authorization": f"Bearer {secret_key}"},
+            timeout=20,
+        )
+        payload = response.json()
+    except Exception as exc:
+        print("Unable to verify seller banner payment:", exc)
+        return jsonify({"error": "Payment verification is temporarily unavailable"}), 502
+
+    transaction = payload.get("data") if payload.get("status") == "success" else None
+    valid = bool(
+        transaction
+        and transaction.get("status") == "successful"
+        and transaction.get("tx_ref") == tx_ref
+        and str(transaction.get("currency") or "").upper() == "NGN"
+        and float(transaction.get("amount") or 0) >= float(ad.get("amount") or 0)
+    )
+    if not valid:
+        return jsonify({"error": "Payment has not been completed or could not be verified"}), 400
+
+    plan = query_one("SELECT duration_days FROM seller_banner_ad_plans WHERE code=%s LIMIT 1", (ad.get("plan_code"),))
+    duration_days = int((plan or {}).get("duration_days") or 30)
+    starts_at = datetime.utcnow()
+    expires_at = starts_at + timedelta(days=duration_days)
+    execute(
+        """
+        UPDATE seller_banner_ads
+        SET transaction_id=%s, payment_status='paid', status='active', starts_at=%s, expires_at=%s
+        WHERE id=%s AND seller_id=%s
+        """,
+        (str(transaction.get("id") or ""), starts_at, expires_at, ad.get("id"), seller_id),
+    )
+    updated = query_one("SELECT * FROM seller_banner_ads WHERE id=%s LIMIT 1", (ad.get("id"),))
+    return jsonify({"success": True, "data": {"ad": serialize_banner_ad(updated)}})
 
 
 @seller_bp.route("/team", methods=["GET"])
